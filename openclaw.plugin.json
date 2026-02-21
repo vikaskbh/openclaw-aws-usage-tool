@@ -1,0 +1,10 @@
+{
+  "id": "aws-usage-tool",
+  "name": "AWS Usage Tool",
+  "description": "Fetch AWS Cost Explorer month-to-date usage and list local AWS profiles.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
