@@ -1,46 +1,15 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { spawn } from "node:child_process";
 
 type Params = {
   action: "current" | "by_service" | "profiles";
   profile?: string;
-  region?: string;
 };
 
-function awsFile(name: string) {
-  return path.join(os.homedir(), ".aws", name);
-}
-
-function getRegionForProfile(profile?: string): string | undefined {
-  const cfg = awsFile("config");
-  if (!fs.existsSync(cfg)) return undefined;
-
-  const txt = fs.readFileSync(cfg, "utf8");
-
-  // AWS config uses:
-  // [default]
-  // [profile name]
-  const section = profile && profile !== "default"
-    ? `profile ${profile}`
-    : "default";
-
-  const re = new RegExp(`\\[${section}\\][^\\[]*?region\\s*=\\s*([^\\n]+)`, "i");
-  const m = txt.match(re);
-  return m?.[1]?.trim();
-}
-
-function listProfiles(): string[] {
-  const out = new Set<string>();
-  const files = [awsFile("credentials"), awsFile("config")];
-  const re = /^\[(?:profile\s+)?([^\]]+)\]/gm;
-  for (const f of files) {
-    if (!fs.existsSync(f)) continue;
-    const txt = fs.readFileSync(f, "utf8");
-    for (const m of txt.matchAll(re)) out.add(m[1].trim());
-  }
-  return [...out].sort();
+function parseProfiles(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function monthToDatePeriod() {
@@ -58,12 +27,21 @@ function runAws(args: string[], envExtras: Record<string, string> = {}): Promise
       env: { ...process.env, ...envExtras },
     });
 
+    const timeout = setTimeout(() => {
+      p.kill();
+      reject(new Error("AWS CLI command timed out after 30000ms."));
+    }, 30000);
+
     let stdout = "";
     let stderr = "";
     p.stdout.on("data", (d) => (stdout += String(d)));
     p.stderr.on("data", (d) => (stderr += String(d)));
-    p.on("error", reject);
+    p.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
     p.on("close", (code) => {
+      clearTimeout(timeout);
       if (code === 0) resolve(stdout);
       else reject(new Error((stderr || `aws exited with code ${code}`).trim()));
     });
@@ -72,14 +50,22 @@ function runAws(args: string[], envExtras: Record<string, string> = {}): Promise
 
 function normalizeAwsError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  if (/Unable to locate credentials/i.test(msg)) return "AWS credentials not found (~/.aws/credentials).";
-  if (/could not be found|The config profile .* could not be found/i.test(msg)) return "AWS profile not found.";
-  if (/AccessDenied|not authorized|UnauthorizedOperation/i.test(msg)) return "Access denied. Need ce:GetCostAndUsage permission.";
-  if (/command not found|is not recognized/i.test(msg)) return "AWS CLI not installed or not in PATH.";
+  if (/Unable to locate credentials|Unable to load credentials|NoCredentialProviders/i.test(msg)) {
+    return "AWS credentials not found. Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.";
+  }
+  if (/could not be found|The config profile .* could not be found|profile .* not found/i.test(msg)) {
+    return "AWS profile not found. Run 'aws configure --profile <name>' or check available profiles with 'aws configure list-profiles'.";
+  }
+  if (/AccessDenied|not authorized|UnauthorizedOperation/i.test(msg)) {
+    return "Access denied. Need ce:GetCostAndUsage permission.";
+  }
+  if (/command not found|is not recognized|ENOENT/i.test(msg)) {
+    return "AWS CLI not installed or not in PATH.";
+  }
   return msg;
 }
 
-async function queryCost(action: "current" | "by_service", profile?: string, region = "us-east-1") {
+async function queryCost(action: "current" | "by_service", profile?: string) {
   const period = monthToDatePeriod();
   const args = [
     "ce",
@@ -91,17 +77,25 @@ async function queryCost(action: "current" | "by_service", profile?: string, reg
     "--metrics",
     "UnblendedCost",
     "--region",
-    region,
+    "us-east-1",
     "--output",
     "json",
   ];
+
   if (action === "by_service") {
     args.push("--group-by", "Type=DIMENSION,Key=SERVICE");
   }
   if (profile) args.push("--profile", profile);
 
   const raw = await runAws(args);
-  const data = JSON.parse(raw);
+
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid JSON returned by AWS CLI.");
+  }
+
   const row = data?.ResultsByTime?.[0] ?? {};
   const total = row?.Total?.UnblendedCost ?? {};
 
@@ -146,29 +140,20 @@ export default function register(api: any) {
         properties: {
           action: { type: "string", enum: ["current", "by_service", "profiles"] },
           profile: { type: "string" },
-          region: { type: "string", default: "us-east-1" },
         },
         required: ["action"],
       },
       async execute(_id: string, params: Params) {
         try {
           if (params.action === "profiles") {
-            const profiles = listProfiles();
+            const out = await runAws(["configure", "list-profiles"]);
+            const profiles = parseProfiles(out);
             return {
-              content: [
-                { type: "text", text: JSON.stringify({ ok: true, action: "profiles", profiles }) },
-              ],
+              content: [{ type: "text", text: JSON.stringify({ ok: true, action: "profiles", profiles }) }],
             };
           }
 
-    const profileRegion = getRegionForProfile(params.profile);
-    const resolvedRegion = params.region || profileRegion || "us-east-1";
-
-    // Cost Explorer is global → always us-east-1
-    const CE_REGION = "us-east-1";
-
-    const result = await queryCost(params.action, params.profile, CE_REGION);
-
+          const result = await queryCost(params.action, params.profile);
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
         } catch (err) {
           return {
